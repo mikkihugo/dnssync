@@ -2,6 +2,8 @@
 
 This plugin provides integration between cPanel's BIND DNS server and a PowerDNS server, allowing for automatic synchronization of DNS zones.
 
+Not for production use.
+
 ## Features
 
 - Automatic detection of new domains in cPanel

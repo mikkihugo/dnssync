@@ -632,76 +632,6 @@ def check_zone_drift(domain):
         return False, f"Error checking drift: {str(e)}"
 
 
-def refresh_domains_metadata(domains, dryrun, verbose=False):
-    """
-    Update metadata for a list of domains to ensure they have the latest settings
-    
-    Args:
-        domains: List of domain names to refresh metadata for
-        dryrun: Boolean indicating whether to perform updates or just simulate
-        verbose: Boolean indicating whether to log detailed information
-    """
-    updated = 0
-    for domain in domains:
-        try:
-            r = pdns_req('GET', domain)
-            if not r.ok:
-                logging.warning(f"Failed to get zone {domain} for metadata refresh: {r.status_code}")
-                continue
-
-            zone = r.json()
-            
-            # Keep existing metadata that we don't manage
-            preserved_metadata = [m for m in zone.get('metadata', []) if m['kind'] not in
-                                ['ALLOW-AXFR-FROM', 'AXFR-SOURCE', 'ALSO-NOTIFY', 'MANAGED-BY',
-                                 'SYNC-DATE', 'DNSSEC-PREVENT-SYNC', 'API-RECTIFY', 'RECTIFY-ZONE',
-                                 'SOA-EDIT-API', 'SOA-EDIT-DNSUPDATE']]
-
-            # Define updated metadata
-            new_metadata = [
-                {'kind': 'ALLOW-AXFR-FROM', 'content': CPANEL_SERVER_IP},
-                {'kind': 'AXFR-SOURCE', 'content': CPANEL_SERVER_IP},
-                {'kind': 'ALSO-NOTIFY', 'content': CPANEL_SERVER_IP},
-                {'kind': 'MANAGED-BY', 'content': 'cpanel-dnssync-script'},
-                {'kind': 'SYNC-DATE', 'content': datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
-                {'kind': 'API-RECTIFY', 'content': '1'},
-                {'kind': 'RECTIFY-ZONE', 'content': '1'},
-                {'kind': 'SOA-EDIT-API', 'content': 'INCEPTION-INCREMENT'}
-            ]
-            
-            # Add DNSSEC settings if enabled
-            if DNSSEC_ENABLED:
-                new_metadata.append({"kind": "DNSSEC-PREVENT-SYNC", "content": "1"})
-
-            # Combine preserved and new metadata
-            zone['metadata'] = preserved_metadata + new_metadata
-            
-            # Ensure zone kind is Native
-            zone['kind'] = 'Native'
-            
-            # Update masters to only include cPanel
-            zone['masters'] = [CPANEL_SERVER_IP]
-
-            if dryrun:
-                if verbose:
-                    logging.info(f"[Dry-run] Would refresh metadata for {domain}")
-                else:
-                    logging.info(f"[Dry-run] Would refresh metadata for domain")
-            else:
-                response = pdns_req('PUT', domain, zone)
-                if response.ok:
-                    logging.info(f"Refreshed metadata for {domain}")
-                    updated += 1
-                else:
-                    logging.error(f"Failed refreshing metadata for {domain}: {response.status_code}, {response.text}")
-        except Exception as e:
-            logging.error(f"Error refreshing metadata for {domain}: {e}")
-            
-    if not dryrun:
-        logging.info(f"Refreshed metadata for {updated} domains")
-
-
-# New function to determine drift direction
 def check_drift_direction(domain):
     """
     Check the direction of zone drift between cPanel and PowerDNS.
@@ -740,4 +670,58 @@ def check_drift_direction(domain):
         for record in zone_data.get('records', []):
             if record.get('type') == 'SOA':
                 soa_parts = record.get('content', '').split()
-                if len(soa_
+                if len(soa_parts) > 2:
+                    pdns_serial = int(soa_parts[2])
+                    break
+        
+        if not pdns_serial:
+            return 1, 0  # Assume cPanel is right if no SOA in PowerDNS
+        
+        # Calculate serial difference using RFC 1982 serial arithmetic
+        # to account for serial number wraparound
+        if cpanel_serial == pdns_serial:
+            return 0, 0  # No drift
+        
+        # Handle serial number wraparound
+        if cpanel_serial > pdns_serial:
+            if cpanel_serial - pdns_serial < 2**31:
+                return 1, cpanel_serial - pdns_serial  # cPanel is newer
+            else:
+                return -1, 2**32 - cpanel_serial + pdns_serial  # PowerDNS is actually newer
+        else:
+            if pdns_serial - cpanel_serial < 2**31:
+                return -1, pdns_serial - cpanel_serial  # PowerDNS is newer
+            else:
+                return 1, 2**32 - pdns_serial + cpanel_serial  # cPanel is actually newer
+    
+    except Exception as e:
+        logging.error(f"Error determining drift direction for {domain}: {e}")
+        return 0, 0  # Return no drift on error
+
+
+def refresh_domains_metadata(domains, dryrun, verbose=False):
+    """
+    Update metadata for a list of domains to ensure they have the latest settings
+    
+    Args:
+        domains: List of domain names to refresh metadata for
+        dryrun: Boolean indicating whether to perform updates or just simulate
+        verbose: Boolean indicating whether to log detailed information
+    """
+    updated = 0
+    for domain in domains:
+        try:
+            r = pdns_req('GET', domain)
+            if not r.ok:
+                logging.warning(f"Failed to get zone {domain} for metadata refresh: {r.status_code}")
+                continue
+
+            zone = r.json()
+            
+            # Keep existing metadata that we don't manage
+            preserved_metadata = [m for m in zone.get('metadata', []) if m['kind'] not in
+                                ['ALLOW-AXFR-FROM', 'AXFR-SOURCE', 'ALSO-NOTIFY', 'MANAGED-BY',
+                                 'SYNC-DATE', 'DNSSEC-PREVENT-SYNC', 'API-RECTIFY', 'RECTIFY-ZONE',
+                                 'SOA-EDIT-API', 'SOA-EDIT-DNSUPDATE']]
+
+            # Define update

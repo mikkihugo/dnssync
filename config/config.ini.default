@@ -1,0 +1,26 @@
+[Settings]
+# Log file path
+log_file = /var/log/central_cloud.log
+
+# Files to track active zones and removal candidates
+active_zones_file = /usr/local/cpanel/whostmgr/docroot/cgi/addon_central_cloud/data/active_zones.txt
+remove_zones_file = /usr/local/cpanel/whostmgr/docroot/cgi/addon_central_cloud/data/removal_zones.txt
+
+# PowerDNS API configuration
+pdns_api_url = http://localhost:8081
+pdns_api_key = YOUR_API_KEY_HERE
+
+# List of nameservers (comma-separated)
+nameservers = ns1.example.com,ns2.example.com
+
+# Master nameserver for AXFR
+masterns = 127.0.0.1
+
+# Domains to exclude from synchronization (comma-separated)
+excluded_domains = 
+
+# Enable bidirectional synchronization
+enable_bidirectional = true
+
+# Enable DNSSEC
+dnssec_enabled = false

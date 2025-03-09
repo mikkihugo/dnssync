@@ -1,0 +1,24 @@
+#!/bin/bash
+
+# Central Cloud PowerDNS Sync - Domain Creation Hook
+# This hook is triggered when a new domain account is created
+
+# Log file
+LOG_FILE="/var/log/centralcloud_hook.log"
+
+# Extract domain from hook data
+DOMAIN="$1"
+
+if [ -z "$DOMAIN" ]; then
+    echo "$(date): Error - Domain name not provided to hook" >> $LOG_FILE
+    exit 1
+fi
+
+echo "$(date): Domain created: $DOMAIN - Starting sync" >> $LOG_FILE
+
+# Run the sync script for this domain
+/usr/local/cpanel/whostmgr/docroot/cgi/addon_central_cloud/scripts/run_sync.py --domain "$DOMAIN"
+
+# Log completion
+echo "$(date): Domain sync requested for $DOMAIN" >> $LOG_FILE
+exit 0

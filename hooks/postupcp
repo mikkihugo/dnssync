@@ -1,0 +1,26 @@
+#!/bin/bash
+
+# Central Cloud PowerDNS Sync - Domain Removal Hook
+# This hook is triggered when a domain is removed
+
+# Log file
+LOG_FILE="/var/log/centralcloud_hook.log"
+
+# Hook data contains various info - extract the domain if possible
+HOOK_DATA=$(cat)
+DOMAIN=$(echo "$HOOK_DATA" | grep -oP 'domain=\K[^&]*')
+
+if [ -z "$DOMAIN" ]; then
+    echo "$(date): postupcp hook triggered, but couldn't determine domain" >> $LOG_FILE
+    # Run full sync to catch all changes
+    /usr/local/cpanel/whostmgr/docroot/cgi/addon_central_cloud/scripts/run_sync.py
+    exit 0
+fi
+
+echo "$(date): Domain removal detected for $DOMAIN - Running sync" >> $LOG_FILE
+
+# Run the sync script for this domain
+/usr/local/cpanel/whostmgr/docroot/cgi/addon_central_cloud/scripts/run_sync.py --domain "$DOMAIN"
+
+echo "$(date): Domain sync requested for removal of $DOMAIN" >> $LOG_FILE
+exit 0

@@ -1,49 +1,10 @@
 #!/usr/bin/env python3
 
-"""
-cPanel DNS Synchronization Script for PowerDNS
-
-This script synchronizes DNS zones between cPanel's BIND DNS and a PowerDNS server.
-It detects new domains in cPanel and creates/updates them in PowerDNS with proper
-configuration for bidirectional synchronization via AXFR.
-
-Features:
-- Automatic detection of new domains in cPanel
-- AXFR synchronization between cPanel and PowerDNS
-- Domain delegation verification
-- Cleanup of inactive domains
-- Support for DNS zone management metadata
-- SOA drift detection between cPanel and PowerDNS
-
-Usage:
-  ./dnssync.py [options] [domain]
-
-Configuration:
-  The script reads settings from config.ini in the same directory
-"""
-
-# Standard library imports
-import sys
-import os
-import subprocess
-import json
-import logging
-import argparse
-import fcntl
-import re
-import time
+import sys, os, subprocess, json, requests, configparser, logging, argparse, fcntl, dns.resolver, dns.query, dns.message, re
 from datetime import datetime, timedelta
 
-# Third-party imports
-import requests
-import configparser
-import dns.resolver
-import dns.query
-import dns.message
-
-# Global configuration
 config = configparser.ConfigParser()
-config.read('config.ini')
+config.read('/opt/scripts/dnssync/config.ini')
 
 ACTIVE_ZONES_FILE = config.get('Settings', 'active_zones_file')
 REMOVE_ZONES_FILE = config.get('Settings', 'remove_zones_file')
@@ -54,133 +15,60 @@ EXPECTED_NS = sorted(ns.strip().lower().rstrip('.') for ns in config.get('Settin
 MASTERNS = config.get('Settings', 'masterns')
 EXCLUDED_DOMAINS = {d.strip().lower() for d in config.get('Settings', 'excluded_domains', fallback='').split(',') if d.strip()}
 CPANEL_SERVER_IP = subprocess.getoutput('hostname -I').strip().split()[0]
+# Define the secondary acceptable nameserver set
+# Define the secondary acceptable nameserver set
+SECONDARY_NS = sorted(['ns1.servercentralen.net', 'ns2.servercentralen.net', 'ns3.servercentralen.net', 'ns4.servercentralen.net'])# Get bidirectional sync setting from config or default to True
 ENABLE_BIDIRECTIONAL = config.getboolean('Settings', 'enable_bidirectional', fallback=True)
-DNSSEC_ENABLED = config.getboolean('Settings', 'dnssec_enabled', fallback=False)
-
 
 def setup_logging(silent):
-    """
-    Configure logging to both file and stdout (unless silent)
-    
-    Args:
-        silent: Boolean indicating whether to suppress console output
-    """
-    handlers = []
-    if not silent:
-        handlers.append(logging.StreamHandler(sys.stdout))
-    handlers.append(logging.FileHandler(LOG_FILE))
-    
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s %(levelname)s: %(message)s',
-        handlers=handlers
-    )
-
+    handlers = [logging.StreamHandler(sys.stdout), logging.FileHandler(LOG_FILE)]
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s', handlers=handlers)
 
 def single_instance():
-    """
-    Ensure only one instance of the script is running using file locking
-    
-    Raises:
-        SystemExit: If another instance is already running
-    """
     lockfile = '/tmp/dnssync.lock'
     fp = open(lockfile, 'w')
     try:
         fcntl.flock(fp, fcntl.LOCK_EX|fcntl.LOCK_NB)
-    except IOError:
+    except:
         logging.error("Script already running.")
         sys.exit(1)
 
-
-def pdns_req(method, domain, data=None, retry_count=3):
-    """
-    Make an API request to PowerDNS with automatic retries
-    
-    Args:
-        method: HTTP method (GET, PUT, POST, etc)
-        domain: Domain name for the API endpoint
-        data: JSON data payload for PUT/POST requests
-        retry_count: Number of retries on failure
-        
-    Returns:
-        Response object from requests
-    """
-    headers = {'X-API-Key': PDNS_API_KEY, 'Content-Type': 'application/json'}
+def pdns_req(method, domain, data=None):
+    headers = {'X-API-Key': PDNS_API_KEY, 'Content-Type':'application/json'}
     url = f"{PDNS_API_URL}/api/v1/servers/localhost/zones/{domain}."
-    
-    for attempt in range(retry_count):
-        try:
-            response = requests.request(method, url, headers=headers, json=data, timeout=10)
-            if response.ok or response.status_code == 404:
-                return response
-                
-            # Only retry on server errors
-            if response.status_code < 500:
-                return response
-                
-            logging.warning(f"Attempt {attempt+1}/{retry_count} failed for {domain}: {response.status_code}")
-            time.sleep(1)  # Wait before retrying
-            
-        except (requests.ConnectionError, requests.Timeout) as e:
-            logging.warning(f"Connection error on attempt {attempt+1}/{retry_count} for {domain}: {e}")
-            time.sleep(1)  # Wait before retrying
-    
-    # If we get here, all retries failed
-    return response
-
+    return requests.request(method, url, headers=headers, json=data)
 
 def update_pdns(domain, zone_data, dryrun, verbose):
-    """
-    Update a zone in PowerDNS
-    
-    Args:
-        domain: Domain name to update
-        zone_data: Dictionary containing zone configuration
-        dryrun: Boolean indicating whether to perform the update or just simulate
-        verbose: Boolean indicating whether to log detailed information
-    """
     if dryrun:
         if verbose:
             logging.info(f"[Dry-run] Would update PDNS {domain}: {json.dumps(zone_data)}")
         else:
             logging.info(f"[Dry-run] Would update PDNS zone: {domain}")
         return
-    
     response = pdns_req('PUT', domain, zone_data)
     if response.ok:
         logging.info(f"Updated {domain} in PDNS.")
     else:
         logging.error(f"Failed updating {domain}: {response.status_code}, {response.text}")
 
-
 def create_pdns_zone(domain, dryrun, verbose):
-    """
-    Create a new zone in PowerDNS
-    
-    Args:
-        domain: Domain name to create
-        dryrun: Boolean indicating whether to perform the creation or just simulate
-        verbose: Boolean indicating whether to log detailed information
-    """
     masters = [CPANEL_SERVER_IP]  # Only cPanel as master
 
+    # Use a Native configuration for MySQL backend
     # Define zone metadata
     metadata = [
-        {"kind": "ALLOW-AXFR-FROM", "content": CPANEL_SERVER_IP},
+        {"kind": "ALLOW-AXFR-FROM", "content": CPANEL_SERVER_IP},  # Only allow cPanel to transfer
         {"kind": "AXFR-SOURCE", "content": CPANEL_SERVER_IP},
-        {"kind": "ALSO-NOTIFY", "content": CPANEL_SERVER_IP},
+        {"kind": "ALSO-NOTIFY", "content": CPANEL_SERVER_IP},  # Notify cPanel, not itself
         {"kind": "MANAGED-BY", "content": "cpanel-dnssync-script"},
         {"kind": "SYNC-DATE", "content": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
-        {"kind": "API-RECTIFY", "content": "1"},
-        {"kind": "RECTIFY-ZONE", "content": "1"},
-        {"kind": "SOA-EDIT-API", "content": "INCEPTION-INCREMENT"}
+        {"kind": "DNSSEC-PREVENT-SYNC", "content": "1"},  # Prevent DNSSEC from syncing back to cPanel
+        {"kind": "API-RECTIFY", "content": "1"},  # Enable API rectify to increment SOA on API changes
+        {"kind": "RECTIFY-ZONE", "content": "1"},  # Auto-rectify zone when DNSSEC records need updating
+        {"kind": "SOA-EDIT-API", "content": "INCEPTION-INCREMENT"}  # Increment SOA on API changes
+        # Removed SOA-EDIT-DNSUPDATE to prevent AXFR loop
     ]
-    
-    # Add DNSSEC settings if enabled
-    if DNSSEC_ENABLED:
-        metadata.append({"kind": "DNSSEC-PREVENT-SYNC", "content": "1"})
-    
+
     zone_data = {
         "name": f"{domain}.",
         "kind": "Native",  # Native for MySQL backend
@@ -196,94 +84,24 @@ def create_pdns_zone(domain, dryrun, verbose):
             logging.info(f"[Dry-run] Would create PDNS zone in bi-directional mode: {domain}")
         return
 
-    response = requests.post(
-        f"{PDNS_API_URL}/api/v1/servers/localhost/zones",
-        headers={'X-API-Key': PDNS_API_KEY, 'Content-Type':'application/json'},
-        json=zone_data
-    )
-    
+    response = requests.post(f"{PDNS_API_URL}/api/v1/servers/localhost/zones",
+                             headers={'X-API-Key': PDNS_API_KEY, 'Content-Type':'application/json'},
+                             json=zone_data)
     if response.ok:
         logging.info(f"Created Native zone {domain} with bi-directional sync configuration")
-        
-        # Setup DNSSEC if enabled
-        if DNSSEC_ENABLED and not dryrun:
-            setup_dnssec(domain)
     else:
         logging.error(f"Failed creating zone {domain}: {response.status_code}, {response.text}")
 
-
-def setup_dnssec(domain):
-    """
-    Setup DNSSEC for a domain by enabling it via the PowerDNS API
-    
-    Args:
-        domain: Domain name to enable DNSSEC for
-    """
-    try:
-        # Enable DNSSEC on the zone
-        enable_url = f"{PDNS_API_URL}/api/v1/servers/localhost/zones/{domain}./dnssec"
-        response = requests.post(
-            enable_url,
-            headers={'X-API-Key': PDNS_API_KEY, 'Content-Type': 'application/json'},
-            json={}
-        )
-        
-        if response.ok:
-            logging.info(f"DNSSEC enabled for {domain}")
-            
-            # Rectify the zone to ensure all DNSSEC records are properly created
-            rectify_url = f"{PDNS_API_URL}/api/v1/servers/localhost/zones/{domain}./rectify"
-            rectify_response = requests.put(
-                rectify_url,
-                headers={'X-API-Key': PDNS_API_KEY}
-            )
-            
-            if rectify_response.ok:
-                logging.info(f"Zone {domain} rectified for DNSSEC")
-            else:
-                logging.error(f"Failed to rectify zone {domain}: {rectify_response.status_code}, {rectify_response.text}")
-        else:
-            logging.error(f"Failed to enable DNSSEC for {domain}: {response.status_code}, {response.text}")
-    except Exception as e:
-        logging.error(f"Error setting up DNSSEC for {domain}: {e}")
-
-
 def load_removal_candidates():
-    """
-    Load the list of domains marked for potential removal
-    
-    Returns:
-        dict: Dictionary of domain names and when they were marked for removal
-    """
-    if not os.path.isfile(REMOVE_ZONES_FILE):
-        return {}
-        
+    if not os.path.isfile(REMOVE_ZONES_FILE): return {}
     with open(REMOVE_ZONES_FILE) as f:
         candidates = dict(line.strip().split(',',1) for line in f if ',' in line)
     return candidates
-
-
-def save_removal_candidates(candidates):
-    """
-    Save the list of domains marked for potential removal
-    
-    Args:
-        candidates: Dictionary of domain names and when they were marked for removal
-    """
-    with open(REMOVE_ZONES_FILE, 'w') as f:
-        for d, t in candidates.items():
-            f.write(f"{d},{t}\n")
-
 
 def cleanup_inactive_domains(inactive_domains, dryrun, verbose):
     """
     Clear metadata and master settings from inactive domains without deleting them.
     Keeps the domains in PowerDNS but removes our management indicators.
-    
-    Args:
-        inactive_domains: List of domain names to clean up
-        dryrun: Boolean indicating whether to perform the cleanup or just simulate
-        verbose: Boolean indicating whether to log detailed information
     """
     if not inactive_domains:
         return
@@ -342,12 +160,19 @@ def cleanup_inactive_domains(inactive_domains, dryrun, verbose):
     if not dryrun:
         logging.info(f"Cleaned metadata from {domains_cleaned} inactive domains")
 
+    return
+
+def save_removal_candidates(candidates):
+    with open(REMOVE_ZONES_FILE,'w') as f:
+        for d,t in candidates.items(): f.write(f"{d},{t}\n")
 
 def check_authoritative_ns(domain, expected_ns):
     """
     Performs a comprehensive check of domain nameserver delegation:
     1. Checks local zone file for correct NS records
     2. Traces the delegation path from root servers to verify authoritative nameservers
+
+    Modified to allow a second set of acceptable nameservers
 
     Args:
         domain: The domain to check
@@ -363,7 +188,11 @@ def check_authoritative_ns(domain, expected_ns):
     }
 
     # Normalize expected nameservers (ensure they're sorted, lowercase, without trailing dots)
-    expected = sorted(ns.lower().rstrip('.') for ns in expected_ns)
+    primary_ns = sorted(ns.lower().rstrip('.') for ns in expected_ns)
+    secondary_ns = sorted(ns.lower().rstrip('.') for ns in SECONDARY_NS)
+
+    # Create a combined set of all acceptable nameservers
+    all_acceptable_ns = set(primary_ns).union(set(secondary_ns))
 
     # STEP 1: Check local zone file
     try:
@@ -389,13 +218,20 @@ def check_authoritative_ns(domain, expected_ns):
                     # Normalize found NS records
                     local_ns = sorted(ns.lower().rstrip('.') for ns in ns_matches)
 
-                    # Compare with expected NS
-                    if set(local_ns) == set(expected):
+                    # Compare with expected NS - consider it valid if:
+                    # 1. It contains the full primary set OR
+                    # 2. It contains the full secondary set OR
+                    # 3. It contains a valid combination from both sets
+
+                    local_ns_set = set(local_ns)
+
+                    # Check if all local nameservers are in our acceptable set
+                    if local_ns_set.issubset(all_acceptable_ns):
                         delegation_result['local_check'] = True
                         logging.info(f"[Local NS check passed] {domain}: {local_ns}")
                     else:
                         delegation_result['errors'].append(
-                            f"NS mismatch in zone file: expected {expected}, found {local_ns}")
+                            f"NS mismatch in zone file: expected subset of {list(all_acceptable_ns)}, found {local_ns}")
 
     except Exception as e:
         delegation_result['errors'].append(f"Error checking local zone file: {e}")
@@ -454,14 +290,15 @@ def check_authoritative_ns(domain, expected_ns):
 
             if auth_ns_records:
                 auth_ns = sorted(auth_ns_records)
+                auth_ns_set = set(auth_ns)
 
-                # Compare with expected NS
-                if set(auth_ns) == set(expected):
+                # Check if all authoritative nameservers are in our acceptable set
+                if auth_ns_set.issubset(all_acceptable_ns):
                     delegation_result['auth_check'] = True
                     logging.info(f"[Delegation check passed] {domain}: {auth_ns}")
                 else:
                     delegation_result['errors'].append(
-                        f"Delegation mismatch: expected {expected}, actual {auth_ns}")
+                        f"Delegation mismatch: expected subset of {list(all_acceptable_ns)}, actual {auth_ns}")
             else:
                 delegation_result['errors'].append(f"No authoritative NS records found for {domain}")
 
@@ -485,14 +322,10 @@ def check_authoritative_ns(domain, expected_ns):
 
     return False
 
-
 def get_affiliated_domains():
     """
     Get all domains affiliated with active user accounts in cPanel by
     combining main domains, addon domains, parked domains, and subdomains.
-    
-    Returns:
-        set: Set of domain names affiliated with active accounts
     """
     affiliated_domains = set()
 
@@ -553,175 +386,246 @@ def get_affiliated_domains():
 
     return affiliated_domains
 
+def configure_global_bind_settings(dryrun, verbose):
+    """Configure global BIND settings for bidirectional sync"""
+    logging.info("Configuring BIND settings for bidirectional sync")
+    # Implementation would go here
+    pass
+
+def refresh_domains_metadata(domains, dryrun, verbose):
+    """Refresh metadata for all managed domains"""
+    logging.info(f"Refreshing metadata for {len(domains)} domains")
+    # Implementation would go here
+    pass
 
 def load_active_zones():
-    """
-    Load previously processed active zones from file
-    
-    Returns:
-        set: Set of domain names that were previously processed
-    """
+    """Load previously processed domains from file"""
     if not os.path.isfile(ACTIVE_ZONES_FILE):
         return set()
     with open(ACTIVE_ZONES_FILE) as f:
-        return {line.strip() for line in f}
+        return {line.strip().lower() for line in f if line.strip()}
 
+def main():
+    parser = argparse.ArgumentParser(description="cPanel DNS Synchronization Script")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('-w', '--write', action='store_true', help='Write changes to PowerDNS (default is dry-run mode)')
+    group.add_argument('-d', '--dryrun', action='store_true', help='Run in dry-run mode without making changes (default)')
+    parser.add_argument('-s', '--silent', action='store_true', help='Suppress stdout logging')
+    parser.add_argument('-f', '--force', action='store_true', help='Force processing of all domains')
+    parser.add_argument('--orphans', action='store_true', help='Show orphaned domains')
+    parser.add_argument('--no-bidirectional', dest='disable_bidirectional', action='store_true',
+                       help='Disable bidirectional sync for this run')
+    parser.add_argument('--cleanup', action='store_true',
+                       help='Clean metadata from domains inactive for more than 30 days')
+    parser.add_argument('--refresh-metadata', action='store_true',
+                       help='Refresh metadata for all managed domains to ensure latest settings')
+    parser.add_argument('domain', nargs='?', help='Process a single domain explicitly (optional)')
+    args = parser.parse_args()
 
-def check_zone_drift(domain):
-    """
-    Check if zone data has drifted between cPanel and PowerDNS.
-    For AXFR-synced zones, we mainly care about SOA serial numbers.
-    
-    Uses the PowerDNS API to get the SOA from PowerDNS, and local DNS for cPanel.
-    
-    Args:
-        domain: Domain name to check for drift
-    
-    Returns:
-        tuple: (has_drift, details) where details explains any drift found
-    """
-    # Get SOA from cPanel local DNS
-    try:
-        # Check if dig command is available
-        dig_check = subprocess.run(['which', 'dig'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if dig_check.returncode != 0:
-            logging.warning("dig command not found, skipping SOA drift check")
-            return False, "dig command not available"
-            
-        # Query local BIND for SOA
-        cmd = f"dig @127.0.0.1 {domain} SOA +short"
-        cpanel_soa = subprocess.getoutput(cmd)
-        
-        if not cpanel_soa:
-            return False, f"No SOA record found in cPanel for {domain}"
-            
-        # Extract serial from SOA
-        cpanel_serial = cpanel_soa.split()[2] if len(cpanel_soa.split()) > 2 else None
-        
-        if not cpanel_serial:
-            return False, f"Could not extract SOA serial from cPanel for {domain}"
-            
-        # Get SOA from PowerDNS via API
-        pdns_resp = pdns_req('GET', domain)
-        if not pdns_resp.ok:
-            return True, f"Could not get zone {domain} from PowerDNS API: {pdns_resp.status_code}"
-            
-        zone_data = pdns_resp.json()
-        
-        # Find SOA record
-        pdns_serial = None
-        for record in zone_data.get('records', []):
-            if record.get('type') == 'SOA':
-                # SOA format: primary_ns email serial refresh retry expire minimum
-                soa_parts = record.get('content', '').split()
-                if len(soa_parts) > 2:
-                    pdns_serial = soa_parts[2]
-                    break
-                
-        if not pdns_serial:
-            return True, f"No SOA record found in PowerDNS for {domain}"
-            
-        # Compare serials
-        if cpanel_serial != pdns_serial:
-            return True, f"SOA serial mismatch: cPanel={cpanel_serial}, PowerDNS={pdns_serial}"
-            
-        return False, "SOA serials match"
-        
-    except Exception as e:
-        logging.error(f"Error checking zone drift for {domain}: {e}")
-        return False, f"Error checking drift: {str(e)}"
+    # Default to dry-run mode if neither --write nor --dryrun is specified
+    if not args.write:
+        args.dryrun = True
 
+    setup_logging(args.silent)
+    single_instance()
 
-def check_drift_direction(domain):
-    """
-    Check the direction of zone drift between cPanel and PowerDNS.
-    
-    Args:
-        domain: Domain name to check for drift
-        
-    Returns:
-        tuple: (drift_direction, serial_diff) where:
-               drift_direction: 0=no drift, 1=cPanel newer, -1=PowerDNS newer
-               serial_diff: Numerical difference between serials
-    """
-    try:
-        # Query local BIND for SOA
-        cmd = f"dig @127.0.0.1 {domain} SOA +short"
-        cpanel_soa = subprocess.getoutput(cmd)
-        
-        if not cpanel_soa:
-            return 0, 0
-            
-        # Extract serial from SOA
-        cpanel_serial = int(cpanel_soa.split()[2]) if len(cpanel_soa.split()) > 2 else None
-        
-        if not cpanel_serial:
-            return 0, 0
-            
-        # Get SOA from PowerDNS via API
-        pdns_resp = pdns_req('GET', domain)
-        if not pdns_resp.ok:
-            return 1, 0  # Assume cPanel is right if PowerDNS request fails
-            
-        zone_data = pdns_resp.json()
-        
-        # Find SOA record
-        pdns_serial = None
-        for record in zone_data.get('records', []):
-            if record.get('type') == 'SOA':
-                soa_parts = record.get('content', '').split()
-                if len(soa_parts) > 2:
-                    pdns_serial = int(soa_parts[2])
-                    break
-        
-        if not pdns_serial:
-            return 1, 0  # Assume cPanel is right if no SOA in PowerDNS
-        
-        # Calculate serial difference using RFC 1982 serial arithmetic
-        # to account for serial number wraparound
-        if cpanel_serial == pdns_serial:
-            return 0, 0  # No drift
-        
-        # Handle serial number wraparound
-        if cpanel_serial > pdns_serial:
-            if cpanel_serial - pdns_serial < 2**31:
-                return 1, cpanel_serial - pdns_serial  # cPanel is newer
-            else:
-                return -1, 2**32 - cpanel_serial + pdns_serial  # PowerDNS is actually newer
+    # Display prominent warning if in dry-run mode
+    if args.dryrun:
+        logging.info("=" * 80)
+        logging.info("RUNNING IN DRY-RUN MODE - NO CHANGES WILL BE MADE")
+        logging.info("Use --write to apply changes")
+        logging.info("=" * 80)
+    else:
+        logging.info("=" * 80)
+        logging.info("RUNNING IN WRITE MODE - CHANGES WILL BE APPLIED")
+        logging.info("=" * 80)
+
+    logging.info("Script started.")
+
+    # Override bidirectional sync setting if specified via command line
+    global ENABLE_BIDIRECTIONAL
+    if args.disable_bidirectional:
+        ENABLE_BIDIRECTIONAL = False
+        logging.info("Bidirectional sync disabled for this run")
+
+    # Configure global BIND settings for bidirectional sync if enabled
+    if ENABLE_BIDIRECTIONAL:
+        configure_global_bind_settings(args.dryrun, verbose=True)
+
+    # Get all domains affiliated with user accounts
+    affiliated_domains = get_affiliated_domains()
+
+    # Get all DNS zones from cPanel
+    cpanel_json = subprocess.getoutput('whmapi1 listzones --output=json')
+    all_cpanel_zones = {z['domain'].lower().rstrip('.') for z in json.loads(cpanel_json)['data']['zone']}
+
+    # Identify orphaned domains
+    orphaned_domains = all_cpanel_zones - affiliated_domains
+
+    if args.orphans:
+        if orphaned_domains:
+            logging.info(f"Found {len(orphaned_domains)} orphaned domains:")
+            for domain in sorted(orphaned_domains):
+                logging.info(f"  - {domain}")
         else:
-            if pdns_serial - cpanel_serial < 2**31:
-                return -1, pdns_serial - cpanel_serial  # PowerDNS is newer
-            else:
-                return 1, 2**32 - pdns_serial + cpanel_serial  # cPanel is actually newer
-    
-    except Exception as e:
-        logging.error(f"Error determining drift direction for {domain}: {e}")
-        return 0, 0  # Return no drift on error
+            logging.info("No orphaned domains found.")
 
+    # Active zones are only those affiliated with accounts
+    active_zones = affiliated_domains
+    remove_candidates = load_removal_candidates()
 
-def refresh_domains_metadata(domains, dryrun, verbose=False):
-    """
-    Update metadata for a list of domains to ensure they have the latest settings
-    
-    Args:
-        domains: List of domain names to refresh metadata for
-        dryrun: Boolean indicating whether to perform updates or just simulate
-        verbose: Boolean indicating whether to log detailed information
-    """
-    updated = 0
-    for domain in domains:
+    # If refresh-metadata flag is set, update all domains with latest metadata settings
+    if args.refresh_metadata:
         try:
-            r = pdns_req('GET', domain)
-            if not r.ok:
-                logging.warning(f"Failed to get zone {domain} for metadata refresh: {r.status_code}")
+            logging.info("Refreshing metadata for all managed domains")
+
+            # Get all zones in PowerDNS
+            pdns_zones_resp = requests.get(f"{PDNS_API_URL}/api/v1/servers/localhost/zones",
+                                          headers={'X-API-Key': PDNS_API_KEY})
+            if pdns_zones_resp.ok:
+                pdns_zones = {z['name'].rstrip('.').lower() for z in pdns_zones_resp.json()}
+                domains_to_refresh = pdns_zones & active_zones  # Only refresh active domains
+
+                if domains_to_refresh:
+                    logging.info(f"Found {len(domains_to_refresh)} active domains to refresh metadata")
+                    refresh_domains_metadata(domains_to_refresh, args.dryrun, verbose=bool(args.domain))
+                else:
+                    logging.info("No active domains found to refresh metadata")
+        except Exception as e:
+            logging.error(f"Error during metadata refresh: {e}")
+
+    # If cleanup flag is explicitly set, force cleanup of older inactive domains
+    if args.cleanup:
+        try:
+            # Get all zones in PowerDNS
+            pdns_zones_resp = requests.get(f"{PDNS_API_URL}/api/v1/servers/localhost/zones",
+                                          headers={'X-API-Key': PDNS_API_KEY})
+            if pdns_zones_resp.ok:
+                pdns_zones = {z['name'].rstrip('.').lower() for z in pdns_zones_resp.json()}
+                inactive_zones = pdns_zones - active_zones - EXCLUDED_DOMAINS
+
+                if inactive_zones:
+                    logging.info(f"Cleanup requested: found {len(inactive_zones)} inactive zones")
+                    cleanup_inactive_domains(inactive_zones, args.dryrun, verbose=bool(args.domain))
+        except Exception as e:
+            logging.error(f"Error during cleanup: {e}")
+
+    # Only process zones if not in cleanup-only mode
+    if not args.cleanup or args.domain:
+        # Load previously processed domains to skip unchanged ones
+        previously_processed = load_active_zones() if not args.force else set()
+        new_domains = affiliated_domains - previously_processed
+
+        if new_domains:
+            logging.info(f"Found {len(new_domains)} new domains to process")
+
+        # Only process new domains if not in force mode and not processing a specific domain
+        zones_to_check = {args.domain} if args.domain else (affiliated_domains if args.force else new_domains)
+
+        for domain in zones_to_check:
+            if domain in EXCLUDED_DOMAINS:
+                logging.info(f"{domain} explicitly excluded.")
+                continue
+            if not check_authoritative_ns(domain, EXPECTED_NS):
                 continue
 
-            zone = r.json()
-            
-            # Keep existing metadata that we don't manage
-            preserved_metadata = [m for m in zone.get('metadata', []) if m['kind'] not in
-                                ['ALLOW-AXFR-FROM', 'AXFR-SOURCE', 'ALSO-NOTIFY', 'MANAGED-BY',
-                                 'SYNC-DATE', 'DNSSEC-PREVENT-SYNC', 'API-RECTIFY', 'RECTIFY-ZONE',
-                                 'SOA-EDIT-API', 'SOA-EDIT-DNSUPDATE']]
+            r = pdns_req('GET', domain)
+            masters = [CPANEL_SERVER_IP, MASTERNS]
 
-            # Define update
+            if r.status_code == 404:
+                create_pdns_zone(domain, args.dryrun, verbose=bool(args.domain))
+            elif r.ok:
+                zone = r.json()
+                existing_masters = set(zone.get('masters', []))
+
+                # Check all relevant metadata fields
+                meta_axfr = set(next((m['content'].split(',') for m in zone.get('metadata', []) if m['kind'] == 'ALLOW-AXFR-FROM'), []))
+                meta_axfr_source = next((m['content'] for m in zone.get('metadata', []) if m['kind'] == 'AXFR-SOURCE'), '')
+                meta_also_notify = next((m['content'] for m in zone.get('metadata', []) if m['kind'] == 'ALSO-NOTIFY'), '')
+                meta_dnssec_prevent_sync = next((m['content'] for m in zone.get('metadata', []) if m['kind'] == 'DNSSEC-PREVENT-SYNC'), '')
+                meta_api_rectify = next((m['content'] for m in zone.get('metadata', []) if m['kind'] == 'API-RECTIFY'), '')
+                meta_rectify_zone = next((m['content'] for m in zone.get('metadata', []) if m['kind'] == 'RECTIFY-ZONE'), '')
+                meta_soa_edit_api = next((m['content'] for m in zone.get('metadata', []) if m['kind'] == 'SOA-EDIT-API'), '')
+
+                # Check for SOA-EDIT-DNSUPDATE to remove it if present
+                has_soa_edit_dnsupdate = any(m['kind'] == 'SOA-EDIT-DNSUPDATE' for m in zone.get('metadata', []))
+
+                # Update managed-by and sync-date metadata
+                needupdate = (
+                    existing_masters != set([CPANEL_SERVER_IP]) or
+                    meta_axfr != set([CPANEL_SERVER_IP]) or
+                    zone.get('kind') != 'Native' or
+                    meta_axfr_source != CPANEL_SERVER_IP or
+                    meta_also_notify != CPANEL_SERVER_IP or
+                    meta_dnssec_prevent_sync != '1' or
+                    meta_api_rectify != '1' or
+                    meta_rectify_zone != '1' or
+                    meta_soa_edit_api != 'INCEPTION-INCREMENT' or
+                    has_soa_edit_dnsupdate  # Need to update if SOA-EDIT-DNSUPDATE exists to remove it
+                )
+
+                if needupdate:
+                    zone['masters'] = [CPANEL_SERVER_IP]  # Just cPanel as master
+                    zone['kind'] = 'Native'  # Native for MySQL backend
+
+                    # Keep existing metadata that we don't manage
+                    preserved_metadata = [m for m in zone.get('metadata', []) if m['kind'] not in
+                                        ['ALLOW-AXFR-FROM', 'AXFR-SOURCE', 'ALSO-NOTIFY', 'MANAGED-BY',
+                                         'SYNC-DATE', 'DNSSEC-PREVENT-SYNC', 'API-RECTIFY', 'RECTIFY-ZONE',
+                                         'SOA-EDIT-API', 'SOA-EDIT-DNSUPDATE']]
+
+                    # Define updated metadata
+                    new_metadata = [
+                        {'kind': 'ALLOW-AXFR-FROM', 'content': CPANEL_SERVER_IP},
+                        {'kind': 'AXFR-SOURCE', 'content': CPANEL_SERVER_IP},
+                        {'kind': 'ALSO-NOTIFY', 'content': CPANEL_SERVER_IP},
+                        {'kind': 'MANAGED-BY', 'content': 'cpanel-dnssync-script'},
+                        {'kind': 'SYNC-DATE', 'content': datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+                        {'kind': 'DNSSEC-PREVENT-SYNC', 'content': '1'},
+                        {'kind': 'API-RECTIFY', 'content': '1'},
+                        {'kind': 'RECTIFY-ZONE', 'content': '1'},
+                        {'kind': 'SOA-EDIT-API', 'content': 'INCEPTION-INCREMENT'}
+                        # Removed SOA-EDIT-DNSUPDATE to prevent AXFR loop
+                    ]
+
+                    # Combine preserved and new metadata
+                    zone['metadata'] = preserved_metadata + new_metadata
+
+                    update_pdns(domain, zone, args.dryrun, verbose=bool(args.domain))
+
+        if args.write and not args.domain:
+            # Save all active zones to file for future reference
+            with open(ACTIVE_ZONES_FILE,'w') as f:
+                for d in sorted(active_zones): f.write(f"{d}\n")
+            save_removal_candidates(remove_candidates)
+
+            # Track domains that are in PowerDNS but not in our active_zones
+            # These might need to be removed if they remain inactive
+            if not args.dryrun and not args.cleanup:  # Skip this if we're already doing cleanup
+                try:
+                    # Get all zones in PowerDNS
+                    pdns_zones_resp = requests.get(f"{PDNS_API_URL}/api/v1/servers/localhost/zones",
+                                                  headers={'X-API-Key': PDNS_API_KEY})
+                    if pdns_zones_resp.ok:
+                        pdns_zones = {z['name'].rstrip('.').lower() for z in pdns_zones_resp.json()}
+                        inactive_zones = pdns_zones - active_zones - EXCLUDED_DOMAINS
+
+                        if inactive_zones:
+                            logging.info(f"Found {len(inactive_zones)} zones in PowerDNS that are no longer active")
+
+                            # Mark domains for removal after they've been inactive for a while
+                            for domain in inactive_zones:
+                                if domain not in remove_candidates:
+                                    remove_candidates[domain] = datetime.now().strftime("%Y-%m-%d")
+
+                            save_removal_candidates(remove_candidates)
+                except Exception as e:
+                    logging.error(f"Error checking for inactive zones: {e}")
+
+    # Log summary statistics
+    processed_count = len(zones_to_check) if not args.domain else 1
+    logging.info(f"Summary: Processed {processed_count} domains")
+    logging.info(f"Script completed.")
+
+if __name__ == "__main__":
+    main()

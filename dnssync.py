@@ -20,10 +20,46 @@ CPANEL_SERVER_IP = subprocess.getoutput('hostname -I').strip().split()[0]
 SECONDARY_NS = sorted(['ns1.servercentralen.net', 'ns2.servercentralen.net', 'ns3.servercentralen.net', 'ns4.servercentralen.net'])# Get bidirectional sync setting from config or default to True
 ENABLE_BIDIRECTIONAL = config.getboolean('Settings', 'enable_bidirectional', fallback=True)
 
-def setup_logging(silent):
-    handlers = [logging.StreamHandler(sys.stdout), logging.FileHandler(LOG_FILE)]
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s', handlers=handlers)
+def main():
+    parser = argparse.ArgumentParser(description="cPanel DNS Synchronization Script")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('-w', '--write', action='store_true', help='Write changes to PowerDNS (default is dry-run mode)')
+    group.add_argument('-d', '--dryrun', action='store_true', help='Run in dry-run mode without making changes (default)')
+    parser.add_argument('-s', '--silent', action='store_true', help='Suppress stdout logging')
+    parser.add_argument('--log', action='store_true', help='Show info, warning, and error logs')
+    parser.add_argument('-f', '--force', action='store_true', help='Force processing of all domains')
+    parser.add_argument('--orphans', action='store_true', help='Show orphaned domains')
+    parser.add_argument('--no-bidirectional', dest='disable_bidirectional', action='store_true', help='Disable bi-directional sync for this run')
+    parser.add_argument('--cleanup', action='store_true', help='Clean metadata from domains inactive for more than 30 days')
+    parser.add_argument('--refresh-metadata', action='store_true', help='Refresh metadata for all managed domains to ensure latest settings')
+    parser.add_argument('domain', nargs='?', help='Process a single domain explicitly (optional)')
+    args = parser.parse_args()
 
+    # Default to dry-run mode if neither --write nor --dryrun is specified
+    if not args.write:
+        args.dryrun = True
+
+    setup_logging(args.silent, args.log)  # Enable logging based on the silent and log arguments
+
+    single_instance()
+
+    # Display prominent warning if in dry-run mode
+    if args.dryrun:
+        logging.info("=" * 80)
+        logging.info("RUNNING IN DRY-RUN MODE - NO CHANGES WILL BE MADE")
+        logging.info("Use --write to apply changes")
+        logging.info("=" * 80)
+    else:
+        logging.info("=" * 80)
+        logging.info("RUNNING IN WRITE MODE - CHANGES WILL BE APPLIED")
+        logging.info("=" * 80)
+
+    logging.info("Script started.")
+    
+    # Rest of your code here...
+
+if __name__ == "__main__":
+    main()
 def single_instance():
     lockfile = '/tmp/dnssync.lock'
     fp = open(lockfile, 'w')
@@ -408,6 +444,7 @@ def main():
     group = parser.add_mutually_exclusive_group()
     group.add_argument('-w', '--write', action='store_true', help='Write changes to PowerDNS (default is dry-run mode)')
     group.add_argument('-d', '--dryrun', action='store_true', help='Run in dry-run mode without making changes (default)')
+    parser.add_argument('--log', action='store_true', help='Show info, warning, and error logs')
     parser.add_argument('-s', '--silent', action='store_true', help='Suppress stdout logging')
     parser.add_argument('-f', '--force', action='store_true', help='Force processing of all domains')
     parser.add_argument('--orphans', action='store_true', help='Show orphaned domains')
@@ -424,7 +461,7 @@ def main():
     if not args.write:
         args.dryrun = True
 
-    setup_logging(args.silent)
+    setup_logging(args.silent, args.log)
     single_instance()
 
     # Display prominent warning if in dry-run mode

@@ -62,9 +62,7 @@ def create_pdns_zone(domain, dryrun, verbose):
         {"kind": "ALSO-NOTIFY", "content": CPANEL_SERVER_IP},  # Notify cPanel, not itself
         {"kind": "MANAGED-BY", "content": "cpanel-dnssync-script"},
         {"kind": "SYNC-DATE", "content": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
-        {"kind": "DNSSEC-PREVENT-SYNC", "content": "1"},  # Prevent DNSSEC from syncing back to cPanel
-        {"kind": "API-RECTIFY", "content": "1"},  # Enable API rectify to increment SOA on API changes
-        {"kind": "RECTIFY-ZONE", "content": "1"},  # Auto-rectify zone when DNSSEC records need updating
+        {"kind": "API-RECTIFY", "content": "1"},  # Enable API rectify to increment SOA on API change
         {"kind": "SOA-EDIT-API", "content": "INCEPTION-INCREMENT"}  # Increment SOA on API changes
         # Removed SOA-EDIT-DNSUPDATE to prevent AXFR loop
     ]
